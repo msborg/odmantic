@@ -196,14 +196,14 @@ def validate_cls_namespace(  # noqa C901
     )
     odm_fields: Dict[str, ODMBaseField] = {}
     references: List[str] = []
-    bson_serialized_fields: Set[str] = set()
+    bson_serializers: Dict[str, Callable] = {}
     mutable_fields: Set[str] = set()
     base_configs: List[type] = [BaseODMConfig]
     for base in reversed(bases):
         if issubclass(base, _BaseODMModel) and base not in (Model, EmbeddedModel):
             odm_fields.update(smart_deepcopy(base.__odm_fields__))
             references.extend(base.__references__)
-            bson_serialized_fields.update(base.__bson_serialized_fields__)
+            bson_serializers.update(base.__bson_serializers__)
             mutable_fields.update(base.__mutable_fields__)
             base_configs.append(base.Config)
 
@@ -231,9 +231,9 @@ def validate_cls_namespace(  # noqa C901
             substituted_type = validate_type(field_type)
             # Handle BSON serialized fields after substitution to allow some
             # builtin substitution
-            bson_serialization_method = getattr(substituted_type, "__bson__", None)
-            if bson_serialization_method is not None:
-                bson_serialized_fields.add(field_name)
+            to_bson = getattr(substituted_type, "__bson__", None)
+            if to_bson is not None:
+                bson_serializers[field_name] = to_bson
             annotations[field_name] = substituted_type
 
     # Validate fields
@@ -359,7 +359,7 @@ def validate_cls_namespace(  # noqa C901
     namespace["__annotations__"] = annotations
     namespace["__odm_fields__"] = odm_fields
     namespace["__references__"] = tuple(references)
-    namespace["__bson_serialized_fields__"] = frozenset(bson_serialized_fields)
+    namespace["__bson_serializers__"] = bson_serializers
     namespace["__mutable_fields__"] = frozenset(mutable_fields)
     namespace["Config"] = config
 
@@ -494,7 +494,7 @@ class _BaseODMModel(pydantic.BaseModel, metaclass=ABCMeta):
 
     if TYPE_CHECKING:
         __odm_fields__: ClassVar[Dict[str, ODMBaseField]] = {}
-        __bson_serialized_fields__: ClassVar[FrozenSet[str]] = frozenset()
+        __bson_serializers__: ClassVar[Dict[str, Callable]] = {}
         __mutable_fields__: ClassVar[FrozenSet[str]] = frozenset()
         __references__: ClassVar[Tuple[str, ...]] = ()
         __pydantic_model__: ClassVar[Type[BaseBSONModel]]
@@ -685,13 +685,13 @@ class _BaseODMModel(pydantic.BaseModel, metaclass=ABCMeta):
             the document associated to the instance
         """
         doc: Dict[str, Any] = {}
-        fields = self.__fields__
-        bson_serialized_fields = self.__bson_serialized_fields__
+        bson_serializers = self.__bson_serializers__
         for field_name, field in self.__odm_fields__.items():
             if include is None or field_name in include:
                 value = getattr(self, field_name)
-                if field_name in bson_serialized_fields:
-                    doc_value = fields[field_name].type_.__bson__(value)
+                bson_serializer = bson_serializers.get(field_name)
+                if bson_serializer:
+                    doc_value = bson_serializer(value)
                 elif isinstance(field, ODMReference):
                     doc_value = getattr(value, value.__primary_field__)
                 else:
