@@ -187,194 +187,184 @@ def validate_type(type_: Type) -> Type:
     return type_
 
 
-class BaseModelMetaclass(pydantic.main.ModelMetaclass):
-    @staticmethod
-    def __validate_cls_namespace__(  # noqa C901
-        name: str, bases: Tuple[type, ...], namespace: Dict
-    ) -> None:
-        """Validate the class name space in place"""
-        annotations = resolve_annotations(
-            namespace.get("__annotations__", {}), namespace.get("__module__")
-        )
-        odm_fields: Dict[str, ODMBaseField] = {}
-        references: List[str] = []
-        bson_serialized_fields: Set[str] = set()
-        mutable_fields: Set[str] = set()
-        base_configs: List[type] = [BaseODMConfig]
-        for base in reversed(bases):
-            if issubclass(base, _BaseODMModel) and base not in (Model, EmbeddedModel):
-                odm_fields.update(smart_deepcopy(base.__odm_fields__))
-                references.extend(base.__references__)
-                bson_serialized_fields.update(base.__bson_serialized_fields__)
-                mutable_fields.update(base.__mutable_fields__)
-                base_configs.append(base.Config)
+def validate_cls_namespace(  # noqa C901
+    name: str, bases: Tuple[type, ...], namespace: Dict
+) -> None:
+    """Validate the class name space in place"""
+    annotations = resolve_annotations(
+        namespace.get("__annotations__", {}), namespace.get("__module__")
+    )
+    odm_fields: Dict[str, ODMBaseField] = {}
+    references: List[str] = []
+    bson_serialized_fields: Set[str] = set()
+    mutable_fields: Set[str] = set()
+    base_configs: List[type] = [BaseODMConfig]
+    for base in reversed(bases):
+        if issubclass(base, _BaseODMModel) and base not in (Model, EmbeddedModel):
+            odm_fields.update(smart_deepcopy(base.__odm_fields__))
+            references.extend(base.__references__)
+            bson_serialized_fields.update(base.__bson_serialized_fields__)
+            mutable_fields.update(base.__mutable_fields__)
+            base_configs.append(base.Config)
 
-        # Ensure the namespace config is valid and combine it with the base configs
-        # and some fixed odmatic configs
-        config = namespace.get("Config")
-        if config:
-            validate_config(config, name)
-            base_configs.append(config)
-        base_configs.reverse()
-        config = combine_configs(
-            *base_configs, validate_all=True, validate_assignment=True
-        )
+    # Ensure the namespace config is valid and combine it with the base configs
+    # and some fixed odmatic configs
+    config = namespace.get("Config")
+    if config:
+        validate_config(config, name)
+        base_configs.append(config)
+    base_configs.reverse()
+    config = combine_configs(*base_configs, validate_all=True, validate_assignment=True)
 
-        # Make sure all fields are defined with type annotation
-        for field_name, value in namespace.items():
-            if (
-                should_touch_field(value=value)
-                and not is_dunder(field_name)
-                and field_name not in annotations
-            ):
+    # Make sure all fields are defined with type annotation
+    for field_name, value in namespace.items():
+        if (
+            should_touch_field(value=value)
+            and not is_dunder(field_name)
+            and field_name not in annotations
+        ):
+            raise TypeError(f"field {field_name} is defined without type annotation")
+
+    # Validate fields types and substitute bson fields
+    for (field_name, field_type) in annotations.items():
+        if not is_dunder(field_name) and should_touch_field(type_=field_type):
+            substituted_type = validate_type(field_type)
+            # Handle BSON serialized fields after substitution to allow some
+            # builtin substitution
+            bson_serialization_method = getattr(substituted_type, "__bson__", None)
+            if bson_serialization_method is not None:
+                bson_serialized_fields.add(field_name)
+            annotations[field_name] = substituted_type
+
+    # Validate fields
+    for (field_name, field_type) in annotations.items():
+        value = namespace.get(field_name, Undefined)
+
+        if is_dunder(field_name) or not should_touch_field(value, field_type):
+            continue  # pragma: no cover
+            # https://github.com/nedbat/coveragepy/issues/198
+
+        if isinstance(value, PDFieldInfo):
+            raise TypeError("please use odmantic.Field instead of pydantic.Field")
+
+        if is_type_mutable(field_type):
+            mutable_fields.add(field_name)
+
+        if lenient_issubclass(field_type, EmbeddedModel):
+            if isinstance(value, ODMFieldInfo):
+                namespace[field_name] = value.pydantic_field_info
+                key_name = value.key_name if value.key_name is not None else field_name
+                primary_field = value.primary_field
+                index = value.index
+                unique = value.unique
+            else:
+                key_name = field_name
+                primary_field = False
+                index = False
+                unique = False
+
+            odm_fields[field_name] = ODMEmbedded(
+                primary_field=primary_field,
+                model=field_type,
+                key_name=key_name,
+                model_config=config,
+                index=index,
+                unique=unique,
+            )
+
+        elif is_type_argument_subclass(field_type, EmbeddedModel):
+            if isinstance(value, ODMFieldInfo):
+                if value.primary_field:
+                    raise TypeError(
+                        "Declaring a generic type of embedded models as a primary "
+                        f"field is not allowed: {field_name} in {name}"
+                    )
+                namespace[field_name] = value.pydantic_field_info
+                key_name = value.key_name if value.key_name is not None else field_name
+                index = value.index
+                unique = value.unique
+            else:
+                key_name = field_name
+                index = False
+                unique = False
+            model = get_first_type_argument_subclassing(field_type, EmbeddedModel)
+            assert model is not None
+            if len(model.__references__) > 0:
                 raise TypeError(
-                    f"field {field_name} is defined without type annotation"
+                    "Declaring a generic type of embedded models containing "
+                    f"references is not allowed: {field_name} in {name}"
                 )
+            generic_origin = get_origin(field_type)
+            assert generic_origin is not None
+            odm_fields[field_name] = ODMEmbeddedGeneric(
+                model=model,
+                generic_origin=generic_origin,
+                key_name=key_name,
+                model_config=config,
+                index=index,
+                unique=unique,
+            )
 
-        # Validate fields types and substitute bson fields
-        for (field_name, field_type) in annotations.items():
-            if not is_dunder(field_name) and should_touch_field(type_=field_type):
-                substituted_type = validate_type(field_type)
-                # Handle BSON serialized fields after substitution to allow some
-                # builtin substitution
-                bson_serialization_method = getattr(substituted_type, "__bson__", None)
-                if bson_serialization_method is not None:
-                    bson_serialized_fields.add(field_name)
-                annotations[field_name] = substituted_type
-
-        # Validate fields
-        for (field_name, field_type) in annotations.items():
-            value = namespace.get(field_name, Undefined)
-
-            if is_dunder(field_name) or not should_touch_field(value, field_type):
-                continue  # pragma: no cover
-                # https://github.com/nedbat/coveragepy/issues/198
-
-            if isinstance(value, PDFieldInfo):
-                raise TypeError("please use odmantic.Field instead of pydantic.Field")
-
-            if is_type_mutable(field_type):
-                mutable_fields.add(field_name)
-
-            if lenient_issubclass(field_type, EmbeddedModel):
-                if isinstance(value, ODMFieldInfo):
-                    namespace[field_name] = value.pydantic_field_info
-                    key_name = (
-                        value.key_name if value.key_name is not None else field_name
-                    )
-                    primary_field = value.primary_field
-                    index = value.index
-                    unique = value.unique
-                else:
-                    key_name = field_name
-                    primary_field = False
-                    index = False
-                    unique = False
-
-                odm_fields[field_name] = ODMEmbedded(
-                    primary_field=primary_field,
-                    model=field_type,
-                    key_name=key_name,
-                    model_config=config,
-                    index=index,
-                    unique=unique,
+        elif lenient_issubclass(field_type, Model):
+            if not isinstance(value, ODMReferenceInfo):
+                raise TypeError(
+                    f"cannot define a reference {field_name} (in {name}) without"
+                    " a Reference assigned to it"
                 )
-
-            elif is_type_argument_subclass(field_type, EmbeddedModel):
-                if isinstance(value, ODMFieldInfo):
-                    if value.primary_field:
-                        raise TypeError(
-                            "Declaring a generic type of embedded models as a primary "
-                            f"field is not allowed: {field_name} in {name}"
-                        )
-                    namespace[field_name] = value.pydantic_field_info
-                    key_name = (
-                        value.key_name if value.key_name is not None else field_name
-                    )
-                    index = value.index
-                    unique = value.unique
-                else:
-                    key_name = field_name
-                    index = False
-                    unique = False
-                model = get_first_type_argument_subclassing(field_type, EmbeddedModel)
-                assert model is not None
-                if len(model.__references__) > 0:
-                    raise TypeError(
-                        "Declaring a generic type of embedded models containing "
-                        f"references is not allowed: {field_name} in {name}"
-                    )
-                generic_origin = get_origin(field_type)
-                assert generic_origin is not None
-                odm_fields[field_name] = ODMEmbeddedGeneric(
-                    model=model,
-                    generic_origin=generic_origin,
-                    key_name=key_name,
-                    model_config=config,
-                    index=index,
-                    unique=unique,
-                )
-
-            elif lenient_issubclass(field_type, Model):
-                if not isinstance(value, ODMReferenceInfo):
-                    raise TypeError(
-                        f"cannot define a reference {field_name} (in {name}) without"
-                        " a Reference assigned to it"
-                    )
+            key_name = value.key_name if value.key_name is not None else field_name
+            raise_on_invalid_key_name(key_name)
+            odm_fields[field_name] = ODMReference(
+                model=field_type, key_name=key_name, model_config=config
+            )
+            references.append(field_name)
+            del namespace[field_name]  # Remove default ODMReferenceInfo value
+        else:
+            if isinstance(value, ODMFieldInfo):
                 key_name = value.key_name if value.key_name is not None else field_name
                 raise_on_invalid_key_name(key_name)
-                odm_fields[field_name] = ODMReference(
-                    model=field_type, key_name=key_name, model_config=config
+                odm_fields[field_name] = ODMField(
+                    primary_field=value.primary_field,
+                    key_name=key_name,
+                    model_config=config,
+                    index=value.index,
+                    unique=value.unique,
                 )
-                references.append(field_name)
-                del namespace[field_name]  # Remove default ODMReferenceInfo value
+                namespace[field_name] = value.pydantic_field_info
+
+            elif value is Undefined:
+                odm_fields[field_name] = ODMField(
+                    primary_field=False, key_name=field_name, model_config=config
+                )
+
             else:
-                if isinstance(value, ODMFieldInfo):
-                    key_name = (
-                        value.key_name if value.key_name is not None else field_name
+                try:
+                    parse_obj_as(field_type, value)
+                except ValidationError:
+                    raise TypeError(
+                        f"Unhandled field definition {name}: {repr(field_type)}"
+                        f" = {repr(value)}"
                     )
-                    raise_on_invalid_key_name(key_name)
-                    odm_fields[field_name] = ODMField(
-                        primary_field=value.primary_field,
-                        key_name=key_name,
-                        model_config=config,
-                        index=value.index,
-                        unique=value.unique,
-                    )
-                    namespace[field_name] = value.pydantic_field_info
+                odm_fields[field_name] = ODMField(
+                    primary_field=False, key_name=field_name, model_config=config
+                )
 
-                elif value is Undefined:
-                    odm_fields[field_name] = ODMField(
-                        primary_field=False, key_name=field_name, model_config=config
-                    )
+    # NOTE: Duplicate key detection make sur that at most one primary key is
+    # defined
+    duplicate_key = find_duplicate_key(odm_fields.values())
+    if duplicate_key is not None:
+        raise TypeError(f"Duplicated key_name: {duplicate_key} in {name}")
 
-                else:
-                    try:
-                        parse_obj_as(field_type, value)
-                    except ValidationError:
-                        raise TypeError(
-                            f"Unhandled field definition {name}: {repr(field_type)}"
-                            f" = {repr(value)}"
-                        )
-                    odm_fields[field_name] = ODMField(
-                        primary_field=False, key_name=field_name, model_config=config
-                    )
+    # Avoid getting the docstrings from the parent classes
+    namespace.setdefault("__doc__", "")
+    namespace["__annotations__"] = annotations
+    namespace["__odm_fields__"] = odm_fields
+    namespace["__references__"] = tuple(references)
+    namespace["__bson_serialized_fields__"] = frozenset(bson_serialized_fields)
+    namespace["__mutable_fields__"] = frozenset(mutable_fields)
+    namespace["Config"] = config
 
-        # NOTE: Duplicate key detection make sur that at most one primary key is
-        # defined
-        duplicate_key = find_duplicate_key(odm_fields.values())
-        if duplicate_key is not None:
-            raise TypeError(f"Duplicated key_name: {duplicate_key} in {name}")
 
-        # Avoid getting the docstrings from the parent classes
-        namespace.setdefault("__doc__", "")
-        namespace["__annotations__"] = annotations
-        namespace["__odm_fields__"] = odm_fields
-        namespace["__references__"] = tuple(references)
-        namespace["__bson_serialized_fields__"] = frozenset(bson_serialized_fields)
-        namespace["__mutable_fields__"] = frozenset(mutable_fields)
-        namespace["Config"] = config
-
+class BaseModelMetaclass(pydantic.main.ModelMetaclass):
     @no_type_check
     def __new__(
         mcs,
@@ -383,16 +373,8 @@ class BaseModelMetaclass(pydantic.main.ModelMetaclass):
         namespace: Dict[str, Any],
         **kwargs: Any,
     ):
-        is_custom_cls = namespace.get(
-            "__module__"
-        ) != "odmantic.model" and namespace.get("__qualname__") not in (
-            "_BaseODMModel",
-            "Model",
-            "EmbeddedModel",
-        )
         cls = super().__new__(mcs, name, bases, namespace, **kwargs)
-
-        if is_custom_cls:
+        if namespace.get("__module__") != __name__:
             config: BaseODMConfig = namespace["Config"]
             # Patch Model related fields to build a "pure" pydantic model
             odm_fields: Dict[str, ODMBaseField] = namespace["__odm_fields__"]
@@ -427,10 +409,8 @@ class ModelMetaclass(BaseModelMetaclass):
         namespace: Dict[str, Any],
         **kwargs: Any,
     ):
-        if namespace.get("__module__") != "odmantic.model" and namespace.get(
-            "__qualname__"
-        ) not in ("_BaseODMModel", "Model"):
-            mcs.__validate_cls_namespace__(name, bases, namespace)
+        if namespace.get("__module__") != __name__:
+            validate_cls_namespace(name, bases, namespace)
             config: BaseODMConfig = namespace["Config"]
             primary_field: Optional[str] = None
             odm_fields: Dict[str, ODMBaseField] = namespace["__odm_fields__"]
@@ -489,11 +469,8 @@ class EmbeddedModelMetaclass(BaseModelMetaclass):
         namespace: Dict[str, Any],
         **kwargs: Any,
     ):
-
-        if namespace.get("__module__") != "odmantic.model" and namespace.get(
-            "__qualname__"
-        ) not in ("_BaseODMModel", "EmbeddedModel"):
-            mcs.__validate_cls_namespace__(name, bases, namespace)
+        if namespace.get("__module__") != __name__:
+            validate_cls_namespace(name, bases, namespace)
             odm_fields: Dict[str, ODMBaseField] = namespace["__odm_fields__"]
             for field in odm_fields.values():
                 if isinstance(field, ODMField) and field.primary_field:
