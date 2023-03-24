@@ -389,27 +389,14 @@ def create_pydantic_model(
     return pydantic_cls
 
 
-class BaseModelMetaclass(pydantic.main.ModelMetaclass):
-    @no_type_check
-    def __new__(
-        mcs,
-        name: str,
-        bases: Tuple[type, ...],
-        namespace: Dict[str, Any],
-        **kwargs: Any,
-    ):
-        cls = super().__new__(mcs, name, bases, namespace, **kwargs)
-        if namespace.get("__module__") != __name__:
-            cls.__pydantic_model__ = create_pydantic_model(name, namespace, **kwargs)
-            for name, field in cls.__odm_fields__.items():
-                field.bind_pydantic_field(cls.__fields__[name])
-                setattr(cls, name, FieldProxy(parent=None, field=field))
-
-        return cls
+def post_process_fields(cls: Type["_BaseODMModel"]) -> None:
+    for name, field in cls.__odm_fields__.items():
+        field.bind_pydantic_field(cls.__fields__[name])
+        setattr(cls, name, FieldProxy(parent=None, field=field))
 
 
 @dataclass_transform(kw_only_default=True, field_specifiers=(Field, ODMFieldInfo))
-class ModelMetaclass(BaseModelMetaclass):
+class ModelMetaclass(pydantic.main.ModelMetaclass):
     @no_type_check
     def __new__(  # noqa C901
         mcs,
@@ -418,58 +405,63 @@ class ModelMetaclass(BaseModelMetaclass):
         namespace: Dict[str, Any],
         **kwargs: Any,
     ):
-        if namespace.get("__module__") != __name__:
-            validate_cls_namespace(name, bases, namespace)
-            config: BaseODMConfig = namespace["Config"]
-            primary_field: Optional[str] = None
-            odm_fields: Dict[str, ODMBaseField] = namespace["__odm_fields__"]
+        if namespace.get("__module__") == __name__:
+            return super().__new__(mcs, name, bases, namespace, **kwargs)
 
-            for field_name, field in odm_fields.items():
-                if isinstance(field, ODMField) and field.primary_field:
-                    primary_field = field_name
-                    break
+        validate_cls_namespace(name, bases, namespace)
+        config: BaseODMConfig = namespace["Config"]
+        primary_field: Optional[str] = None
+        odm_fields: Dict[str, ODMBaseField] = namespace["__odm_fields__"]
 
-            if primary_field is None:
-                if "id" in odm_fields:
-                    raise TypeError(
-                        "can't automatically generate a primary field since an 'id' "
-                        "field already exists"
-                    )
-                primary_field = "id"
-                odm_fields["id"] = ODMField(
-                    primary_field=True, key_name="_id", model_config=config
+        for field_name, field in odm_fields.items():
+            if isinstance(field, ODMField) and field.primary_field:
+                primary_field = field_name
+                break
+
+        if primary_field is None:
+            if "id" in odm_fields:
+                raise TypeError(
+                    "can't automatically generate a primary field since an 'id' "
+                    "field already exists"
                 )
-                namespace["id"] = PDField(default_factory=ObjectId)
-                namespace["__annotations__"]["id"] = ObjectId
+            primary_field = "id"
+            odm_fields["id"] = ODMField(
+                primary_field=True, key_name="_id", model_config=config
+            )
+            namespace["id"] = PDField(default_factory=ObjectId)
+            namespace["__annotations__"]["id"] = ObjectId
 
-            namespace["__primary_field__"] = primary_field
+        namespace["__primary_field__"] = primary_field
 
-            if config.collection is not None:
-                collection_name = config.collection
-            elif "__collection__" in namespace:
-                collection_name = namespace["__collection__"]
-                warnings.warn(
-                    "Defining the collection name with `__collection__` is deprecated. "
-                    "Please use `collection` config attribute instead.",
-                    DeprecationWarning,
-                )
-            else:
-                cls_name = name
-                if cls_name.endswith("Model"):
-                    # TODO document this
-                    cls_name = cls_name[:-5]  # Strip Model in the class name
-                collection_name = to_snake_case(cls_name)
-            raise_on_invalid_collection_name(collection_name, cls_name=name)
-            namespace["__collection__"] = collection_name
+        if config.collection is not None:
+            collection_name = config.collection
+        elif "__collection__" in namespace:
+            collection_name = namespace["__collection__"]
+            warnings.warn(
+                "Defining the collection name with `__collection__` is deprecated. "
+                "Please use `collection` config attribute instead.",
+                DeprecationWarning,
+            )
+        else:
+            cls_name = name
+            if cls_name.endswith("Model"):
+                # TODO document this
+                cls_name = cls_name[:-5]  # Strip Model in the class name
+            collection_name = to_snake_case(cls_name)
+        raise_on_invalid_collection_name(collection_name, cls_name=name)
+        namespace["__collection__"] = collection_name
 
-        return super().__new__(mcs, name, bases, namespace, **kwargs)
+        cls = super().__new__(mcs, name, bases, namespace, **kwargs)
+        cls.__pydantic_model__ = create_pydantic_model(name, namespace, **kwargs)
+        post_process_fields(cls)
+        return cls
 
     def __pos__(cls) -> str:
         return cast(str, getattr(cls, "__collection__"))
 
 
 @dataclass_transform(kw_only_default=True, field_specifiers=(Field, ODMFieldInfo))
-class EmbeddedModelMetaclass(BaseModelMetaclass):
+class EmbeddedModelMetaclass(pydantic.main.ModelMetaclass):
     @no_type_check
     def __new__(
         mcs,
@@ -478,16 +470,20 @@ class EmbeddedModelMetaclass(BaseModelMetaclass):
         namespace: Dict[str, Any],
         **kwargs: Any,
     ):
-        if namespace.get("__module__") != __name__:
-            validate_cls_namespace(name, bases, namespace)
-            odm_fields: Dict[str, ODMBaseField] = namespace["__odm_fields__"]
-            for field in odm_fields.values():
-                if isinstance(field, ODMField) and field.primary_field:
-                    raise TypeError(
-                        f"cannot define a primary field in {name} embedded document"
-                    )
+        if namespace.get("__module__") == __name__:
+            return super().__new__(mcs, name, bases, namespace, **kwargs)
 
-        return super().__new__(mcs, name, bases, namespace, **kwargs)
+        validate_cls_namespace(name, bases, namespace)
+        odm_fields: Dict[str, ODMBaseField] = namespace["__odm_fields__"]
+        for field in odm_fields.values():
+            if isinstance(field, ODMField) and field.primary_field:
+                raise TypeError(
+                    f"cannot define a primary field in {name} embedded document"
+                )
+        cls = super().__new__(mcs, name, bases, namespace, **kwargs)
+        cls.__pydantic_model__ = create_pydantic_model(name, namespace, **kwargs)
+        post_process_fields(cls)
+        return cls
 
 
 BaseT = TypeVar("BaseT", bound="_BaseODMModel")
