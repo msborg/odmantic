@@ -6,7 +6,7 @@ import uuid
 import warnings
 from abc import ABCMeta
 from collections.abc import Callable as abcCallable
-from types import FunctionType
+from types import FunctionType, new_class
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -364,6 +364,31 @@ def validate_cls_namespace(  # noqa C901
     namespace["Config"] = config
 
 
+def create_pydantic_model(
+    name: str,
+    namespace: Dict[str, Any],
+    **kwargs: Any,
+) -> Type[pydantic.BaseModel]:
+    def populate_ns(new_namespace: Dict[str, Any]) -> None:
+        new_namespace.update(
+            namespace,
+            __annotations__={
+                field_name: getattr(field_type, "__pydantic_model__", field_type)
+                for field_name, field_type in namespace["__annotations__"].items()
+            },
+        )
+
+    pydantic_cls = cast(
+        Type[pydantic.BaseModel],
+        new_class(f"{name}.__pydantic_model__", (BaseBSONModel,), kwargs, populate_ns),
+    )
+    # Change the title to generate clean JSON schemas from this "pure" model
+    if pydantic_cls.__config__.title is None:
+        pydantic_cls.__config__.title = name
+
+    return pydantic_cls
+
+
 class BaseModelMetaclass(pydantic.main.ModelMetaclass):
     @no_type_check
     def __new__(
@@ -375,23 +400,7 @@ class BaseModelMetaclass(pydantic.main.ModelMetaclass):
     ):
         cls = super().__new__(mcs, name, bases, namespace, **kwargs)
         if namespace.get("__module__") != __name__:
-            config: BaseODMConfig = namespace["Config"]
-            # Patch Model related fields to build a "pure" pydantic model
-            odm_fields: Dict[str, ODMBaseField] = namespace["__odm_fields__"]
-            for field_name, field in odm_fields.items():
-                if isinstance(field, (ODMReference, ODMEmbedded)):
-                    namespace["__annotations__"][
-                        field_name
-                    ] = field.model.__pydantic_model__
-            # Build the pydantic model
-            pydantic_cls = pydantic.main.ModelMetaclass.__new__(
-                mcs, f"{name}.__pydantic_model__", (BaseBSONModel,), namespace, **kwargs
-            )
-            # Change the title to generate clean JSON schemas from this "pure" model
-            if config.title is None:
-                pydantic_cls.__config__.title = name
-            cls.__pydantic_model__ = pydantic_cls
-
+            cls.__pydantic_model__ = create_pydantic_model(name, namespace, **kwargs)
             for name, field in cls.__odm_fields__.items():
                 field.bind_pydantic_field(cls.__fields__[name])
                 setattr(cls, name, FieldProxy(parent=None, field=field))
